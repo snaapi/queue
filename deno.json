@@ -1,6 +1,10 @@
 {
+  "name": "@snaapi/queue",
+  "version": "0.1.0",
+  "exports": "./mod.ts",
   "tasks": {
-    "dev": "deno run --watch main.ts"
+    "check": "deno check mod.ts",
+    "test": "deno test --unstable-kv -A"
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@1"
