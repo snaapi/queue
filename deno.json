@@ -1,6 +1,6 @@
 {
   "name": "@snaapi/queue",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "exports": "./mod.ts",
   "tasks": {
     "check": "deno check mod.ts",
