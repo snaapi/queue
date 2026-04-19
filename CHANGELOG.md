@@ -1,6 +1,10 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+## [1.0.4] - 2026-04-19
+
+### Other
+
+- add license
 
 ## [1.0.0] - 2026-04-18
 
