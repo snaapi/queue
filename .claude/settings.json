@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(deno fmt *)"
+      "Bash(deno fmt *)",
+      "Bash(git -C /Users/jason/go/src/github.com/snaapi/queue config user.name)"
     ]
   }
 }
