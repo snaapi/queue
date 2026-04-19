@@ -17,6 +17,8 @@ style.
 
 ## Using GitHub
 
-For questions about GitHub, use the gh tool Never mention Claude Code in PR
-descriptions, PR comments, or issue comments Do not include a "Test plan"
+For questions about GitHub, use the gh tool 
+Never mention Claude Code in PR
+descriptions, PR comments, or issue comments 
+Do not include a "Test plan"
 section in PR descriptions
