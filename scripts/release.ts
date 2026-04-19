@@ -62,7 +62,10 @@ async function getCommitsSince(ref: string | null): Promise<string[]> {
     ? ["git", "log", `${ref}..HEAD`, "--pretty=format:%s"]
     : ["git", "log", "--pretty=format:%s"];
   const out = await run(args, { capture: true });
-  return out.split("\n").map((l) => l.trim()).filter(Boolean);
+  return out
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
 }
 
 function categorize(commits: string[]): Record<string, string[]> {
@@ -106,8 +109,7 @@ function renderChangelog(
 
 async function updateChangelog(entry: string): Promise<void> {
   const path = "CHANGELOG.md";
-  const header =
-    "# Changelog\n\nAll notable changes to this project will be documented in this file.\n\n";
+  const header = "# Changelog\n\n";
   let existing = "";
   try {
     existing = await Deno.readTextFile(path);
@@ -126,17 +128,13 @@ async function updateChangelog(entry: string): Promise<void> {
 async function main() {
   const arg = Deno.args[0];
   if (!arg) {
-    console.error(
-      "Usage: deno task release <patch|minor|major|x.y.z>",
-    );
+    console.error("Usage: deno task release <patch|minor|major|x.y.z>");
     Deno.exit(1);
   }
 
   const status = await run(["git", "status", "--porcelain"], { capture: true });
   if (status.trim()) {
-    console.error(
-      "Working tree is not clean. Commit or stash changes first.",
-    );
+    console.error("Working tree is not clean. Commit or stash changes first.");
     Deno.exit(1);
   }
 
@@ -170,7 +168,7 @@ async function main() {
   console.log("");
   console.log("Review the changes, then run:");
   console.log(`  git add deno.json CHANGELOG.md`);
-  console.log(`  git commit -m "chore: release v${next}"`);
+  console.log(`  git commit -s -m "chore: release v${next}"`);
   console.log(`  git tag v${next}`);
   console.log(`  git push && git push --tags`);
 }
