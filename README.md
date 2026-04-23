@@ -36,6 +36,11 @@ await queue.dispatch("send-email", {
 }).send();
 ```
 
+Note that `queue.listen()` attaches to the `Deno.Kv` handle and must run in the
+same long lived process that holds that handle. A script that only dispatches
+jobs and then exits will enqueue work, but nothing will consume it until a
+process with `listen()` is running against the same KV store.
+
 ## Dispatch Options
 
 The `dispatch()` method returns a builder. Chain options before calling
@@ -44,13 +49,23 @@ The `dispatch()` method returns a builder. Chain options before calling
 ```ts
 await queue
   .dispatch("send-email", { to: "user@example.com", subject: "Hello" })
-  .delay(5000) // wait 5 seconds before delivery
+  .delay(5000) // wait 5 seconds before delivery (default: 0)
   .onQueue("emails") // named queue (default: "default")
   .attempts(5) // max retry attempts (default: 3)
-  .backoff([1000, 5000, 30000]) // backoff delays between retries
-  .unique("welcome-user@example.com", 60_000) // prevent duplicates for 60s
+  .backoff([1000, 5000, 30000]) // backoff delays in ms (default: [1000, 5000, 30000])
+  .unique("welcome-user@example.com", 60_000) // prevent duplicates (default TTL: 300000 ms / 5 min)
   .send();
 ```
+
+### Defaults
+
+| Option     | Default                |
+| ---------- | ---------------------- |
+| `onQueue`  | `"default"`            |
+| `attempts` | `3`                    |
+| `backoff`  | `[1000, 5000, 30000]`  |
+| `unique`   | TTL `300_000` ms (5 m) |
+| `delay`    | `0`                    |
 
 ## Middleware
 
