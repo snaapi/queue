@@ -1,10 +1,10 @@
 import type { JobChainStep } from "./types.ts";
 import type { QueueEnvelope } from "./envelope.ts";
-import { Keys } from "./keys.ts";
+import type { QueueDriver } from "./drivers/types.ts";
 
 /** Dispatch a chain of jobs. The first job is enqueued immediately; remaining steps are carried in the envelope. */
 export async function dispatchChain(
-  kv: Deno.Kv,
+  driver: QueueDriver,
   steps: JobChainStep[],
 ): Promise<void> {
   if (steps.length === 0) return;
@@ -24,15 +24,13 @@ export async function dispatchChain(
     chain: rest.length > 0 ? rest : undefined,
   };
 
-  await kv.enqueue(envelope, {
-    keysIfUndelivered: [Keys.undelivered(envelope.id)],
-  });
+  await driver.enqueue(envelope, {});
 }
 
 /** Enqueue the next step in a chain. Called by the worker after a successful job. */
 export async function enqueueChainStep(
-  kv: Deno.Kv,
+  driver: QueueDriver,
   remainingSteps: JobChainStep[],
 ): Promise<void> {
-  await dispatchChain(kv, remainingSteps);
+  await dispatchChain(driver, remainingSteps);
 }

@@ -1,33 +1,33 @@
-import type { JobContext, JobHandler, JobMiddleware } from "./types.ts";
-import { isQueueEnvelope, type QueueEnvelope } from "./envelope.ts";
-import { Keys } from "./keys.ts";
+import type {
+  FailedJob,
+  JobContext,
+  JobHandler,
+  JobMiddleware,
+} from "./types.ts";
+import type { QueueEnvelope } from "./envelope.ts";
+import type { QueueDriver } from "./drivers/types.ts";
 import { runMiddlewareChain } from "./middleware.ts";
-import { storeFailed } from "./failed.ts";
 import { enqueueChainStep } from "./chain.ts";
 
 export interface WorkerConfig {
-  kv: Deno.Kv;
+  driver: QueueDriver;
   handlers: Map<string, JobHandler>;
   middlewareMap: Map<string, JobMiddleware[]>;
   globalMiddleware: JobMiddleware[];
 }
 
-/** Create the listener function to pass to kv.listenQueue(). */
+/** Build the per-envelope handler the driver invokes for each delivered job. */
 export function createListener(
   config: WorkerConfig,
-): (msg: unknown) => Promise<void> {
-  const { kv, handlers, middlewareMap, globalMiddleware } = config;
+): (envelope: QueueEnvelope) => Promise<void> {
+  const { driver, handlers, middlewareMap, globalMiddleware } = config;
 
-  return async (msg: unknown) => {
-    // Ignore messages not from this library
-    if (!isQueueEnvelope(msg)) return;
-
-    const envelope: QueueEnvelope = msg;
+  return async (envelope: QueueEnvelope) => {
     const handler = handlers.get(envelope.jobName);
 
     if (!handler) {
       await storeFailed(
-        kv,
+        driver,
         envelope,
         `No handler registered for "${envelope.jobName}"`,
       );
@@ -40,10 +40,10 @@ export function createListener(
       maxAttempts: envelope.maxAttempts,
       queue: envelope.queue,
       id: envelope.id,
-      kv,
+      locks: driver.locks,
+      counters: driver.counters,
     };
 
-    // Build middleware chain: global first, then per-job
     const jobMw = middlewareMap.get(envelope.jobName) ?? [];
     const allMiddleware = [...globalMiddleware, ...jobMw];
 
@@ -57,18 +57,17 @@ export function createListener(
         },
       );
 
-      // Success: clear unique lock if present
+      // Success: clear unique lock if present.
       if (envelope.uniqueKey) {
-        await kv.delete(Keys.unique(envelope.uniqueKey));
+        await driver.clearUniqueLock(envelope.uniqueKey);
       }
 
-      // Advance chain if there are remaining steps
+      // Advance chain.
       if (envelope.chain && envelope.chain.length > 0) {
-        await enqueueChainStep(kv, envelope.chain);
+        await enqueueChainStep(driver, envelope.chain);
       }
     } catch (error) {
       if (envelope.attempt < envelope.maxAttempts) {
-        // Re-enqueue with incremented attempt and backoff delay
         const backoffIndex = envelope.attempt - 1;
         const delay = envelope.backoffSchedule[backoffIndex] ??
           envelope.backoffSchedule[envelope.backoffSchedule.length - 1] ??
@@ -78,19 +77,34 @@ export function createListener(
           ...envelope,
           attempt: envelope.attempt + 1,
         };
-        await kv.enqueue(retryEnvelope, { delay });
+        await driver.enqueue(retryEnvelope, { delay });
       } else {
-        // Max attempts exhausted: store as failed
         const errorMessage = error instanceof Error
           ? error.message
           : String(error);
-        await storeFailed(kv, envelope, errorMessage);
+        await storeFailed(driver, envelope, errorMessage);
 
-        // Clear unique lock so the job can be retried manually
         if (envelope.uniqueKey) {
-          await kv.delete(Keys.unique(envelope.uniqueKey));
+          await driver.clearUniqueLock(envelope.uniqueKey);
         }
       }
     }
   };
+}
+
+async function storeFailed(
+  driver: QueueDriver,
+  envelope: QueueEnvelope,
+  error: string,
+): Promise<void> {
+  const record: FailedJob = {
+    id: envelope.id,
+    jobName: envelope.jobName,
+    queue: envelope.queue,
+    payload: envelope.payload,
+    error,
+    failedAt: Date.now(),
+    attempts: envelope.attempt,
+  };
+  await driver.failed.store(record, envelope);
 }

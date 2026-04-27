@@ -1,22 +1,26 @@
 # @snaapi/queue
 
-A job queue for Deno built on top of Deno KV. No external dependencies, no
-separate queue server. Jobs are dispatched, persisted, retried, and chained
-using the KV queue primitives that ship with Deno.
+A Postgres backed job queue for Deno. Designed for Deno Deploy and any
+environment where you need durable, multi worker job processing. Uses
+`LISTEN`/`NOTIFY` for low latency wakeups and `SELECT FOR UPDATE SKIP LOCKED`
+for safe concurrent reservation.
 
 ## Install
 
 ```ts
-import { Queue } from "@snaapi/queue";
+import { PostgresDriver, Queue } from "@snaapi/queue";
 ```
 
 ## Quick Start
 
 ```ts
-import { Queue } from "@snaapi/queue";
+import { PostgresDriver, Queue } from "@snaapi/queue";
 import type { JobHandler } from "@snaapi/queue";
 
-const kv = await Deno.openKv();
+const driver = new PostgresDriver({
+  connectionString: Deno.env.get("DATABASE_URL")!,
+});
+const queue = new Queue(driver);
 
 const sendEmail: JobHandler<{ to: string; subject: string }> = {
   handle(payload, ctx) {
@@ -26,7 +30,6 @@ const sendEmail: JobHandler<{ to: string; subject: string }> = {
   },
 };
 
-const queue = new Queue(kv);
 queue.register("send-email", sendEmail);
 queue.listen();
 
@@ -36,10 +39,86 @@ await queue.dispatch("send-email", {
 }).send();
 ```
 
-Note that `queue.listen()` attaches to the `Deno.Kv` handle and must run in the
-same long lived process that holds that handle. A script that only dispatches
-jobs and then exits will enqueue work, but nothing will consume it until a
-process with `listen()` is running against the same KV store.
+Note that `queue.listen()` attaches to the backing store and must run in the
+same long lived process. A script that only dispatches jobs and then exits will
+enqueue work, but nothing will consume it until a process with `listen()` is
+running against the same database.
+
+## Driver
+
+```ts
+import { PostgresDriver, Queue } from "@snaapi/queue";
+
+const driver = new PostgresDriver({
+  connectionString: Deno.env.get("DATABASE_URL")!,
+  pollIntervalMs: 1000, // fallback when LISTEN/NOTIFY misses (default 1000)
+  concurrency: 1, // in-flight jobs per listener (default 1)
+  reserveTtlMs: 5 * 60_000, // how long a worker can hold a job before peers can reclaim it
+  tablePrefix: "snaapi_", // see "Table prefix" below
+});
+const queue = new Queue(driver);
+```
+
+The driver wakes up via `LISTEN`/`NOTIFY` when a new job is enqueued and falls
+back to a polling timer for delayed jobs. Multiple worker processes can
+`listen()` against the same database. `SELECT FOR UPDATE SKIP LOCKED` ensures
+each ready job is reserved by exactly one worker. Reserved jobs are deleted only
+after the handler returns, so a worker crash leaves the row reserved until
+`reserveTtlMs` elapses, at which point a peer can reclaim it.
+
+### Auto migration
+
+The Postgres driver runs `migrate()` lazily on first use. The schema is
+idempotent (`CREATE TABLE IF NOT EXISTS`), so it is safe to leave on across
+deploys. Disable it (and run migrations as a separate step) by passing
+`autoMigrate: false`:
+
+```ts
+const driver = new PostgresDriver({
+  connectionString: Deno.env.get("DATABASE_URL")!,
+  autoMigrate: false,
+});
+await driver.migrate(); // run explicitly if you prefer
+```
+
+The standalone task is also available:
+
+```bash
+DATABASE_URL=postgres://... deno task db:migrate
+```
+
+### Table prefix
+
+By default the driver creates four tables: `snaapi_jobs`, `snaapi_failed_jobs`,
+`snaapi_locks`, `snaapi_counters`. The prefix (default `snaapi_`) is
+configurable via the `tablePrefix` option or the `QUEUE_TABLE_PREFIX` env var.
+The prefix must match `[a-zA-Z_][a-zA-Z0-9_]*`.
+
+```ts
+new PostgresDriver({
+  connectionString: url,
+  tablePrefix: "myapp_",
+  // tables become myapp_jobs, myapp_failed_jobs, myapp_locks, myapp_counters
+});
+```
+
+### Local development
+
+A `compose.yaml` ships with the project:
+
+```bash
+docker compose up -d postgres
+export DATABASE_URL=postgres://queue:queue@localhost:5444/queue
+deno task test
+```
+
+### Migrating from 1.x
+
+Versions before 2.0 took a `Deno.Kv` directly and exposed `ctx.kv` to handlers.
+The 2.x line drops Deno KV support entirely (KV Connect on Deno Deploy does not
+support `enqueue`). Pass a `PostgresDriver` to the `Queue` constructor and use
+`ctx.locks` / `ctx.counters` from middleware instead of `ctx.kv`. Pending jobs
+do not migrate between stores; drain the KV queue before cutting over.
 
 ## Dispatch Options
 
@@ -129,8 +208,8 @@ await queue.chain([
 
 ## Failed Jobs
 
-Jobs that exhaust all retry attempts are stored in KV. You can inspect, retry,
-or remove them.
+Jobs that exhaust all retry attempts are persisted to the backing store. You can
+inspect, retry, or remove them.
 
 ```ts
 // List failed jobs
@@ -163,7 +242,8 @@ interface JobContext {
   maxAttempts: number; // configured max attempts
   queue: string; // queue name
   id: string; // unique dispatch ID
-  kv: Deno.Kv; // KV store reference
+  locks: LockDriver; // mutex primitive used by withoutOverlapping
+  counters: CounterDriver; // counter primitive used by rateLimit
 }
 ```
 

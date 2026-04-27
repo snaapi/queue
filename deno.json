@@ -4,10 +4,14 @@
   "exports": "./mod.ts",
   "tasks": {
     "check": "deno check mod.ts",
-    "test": "deno test --unstable-kv -A",
+    "test": "deno test -A tests/queue_test.ts",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:migrate": "deno run -A scripts/migrate.ts",
     "release": "deno run -A scripts/release.ts"
   },
   "imports": {
-    "@std/assert": "jsr:@std/assert@1"
+    "@std/assert": "jsr:@std/assert@1",
+    "pg": "npm:pg@^8.11"
   }
 }
