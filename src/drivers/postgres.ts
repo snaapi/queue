@@ -58,6 +58,12 @@ function resolvePrefix(opts: PostgresDriverOptions): string {
     DEFAULT_TABLE_PREFIX;
 }
 
+function uniqueLockKey(key: string): string {
+  // Namespace the unique-dispatch lock to avoid colliding with other lock
+  // keys consumers may use through ctx.locks (`withoutOverlapping`, etc).
+  return `unique:${key}`;
+}
+
 function tableNamesFor(prefix: string): TableNames {
   // Identifiers come from config, not user input; bare interpolation is safe.
   // We also validate the prefix to keep that promise honest.
@@ -85,9 +91,9 @@ CREATE TABLE IF NOT EXISTS ${t.jobs} (
   reserved_at  TIMESTAMPTZ,
   unique_key   TEXT UNIQUE
 );
-CREATE INDEX IF NOT EXISTS ${t.jobs}_ready_idx
-  ON ${t.jobs} (queue, available_at)
-  WHERE reserved_at IS NULL;
+DROP INDEX IF EXISTS ${t.jobs}_ready_idx;
+CREATE INDEX IF NOT EXISTS ${t.jobs}_available_idx
+  ON ${t.jobs} (available_at);
 
 CREATE TABLE IF NOT EXISTS ${t.failedJobs} (
   id         UUID PRIMARY KEY,
@@ -126,7 +132,7 @@ class PgFailedStore implements FailedJobDriver {
     this.#ensureReady = ensureReady;
   }
 
-  async store(record: FailedJob): Promise<void> {
+  async store(record: FailedJob, envelope: QueueEnvelope): Promise<void> {
     await this.#ensureReady();
     await this.#pool.query(
       `INSERT INTO ${this.#t.failedJobs}
@@ -145,7 +151,7 @@ class PgFailedStore implements FailedJobDriver {
         record.error,
         record.failedAt,
         record.attempts,
-        JSON.stringify({ ...record, failedAt: record.failedAt }),
+        JSON.stringify(envelope),
       ],
     );
   }
@@ -211,7 +217,10 @@ class PgFailedStore implements FailedJobDriver {
         queue: original.queue,
         attempt: 1,
         maxAttempts: original.maxAttempts,
-        backoffSchedule: original.backoffSchedule ?? [1000, 5000, 30000],
+        backoffSchedule: original.backoffSchedule,
+        uniqueKey: original.uniqueKey,
+        uniqueTtl: original.uniqueTtl,
+        chain: original.chain,
       };
       await insertJob(client, this.#t, fresh, 0);
       await client.query("COMMIT");
@@ -332,16 +341,17 @@ async function insertJob(
   envelope: QueueEnvelope,
   delayMs: number,
 ): Promise<boolean> {
+  // unique_key is intentionally NULL: dedup is enforced via the locks table
+  // (see PostgresDriver.enqueueUnique). Keeping the column NULL means a
+  // retry insert never collides with the still-reserved original row.
   const res = await client.query(
-    `INSERT INTO ${t.jobs} (id, queue, envelope, available_at, unique_key)
-       VALUES ($1, $2, $3, NOW() + ($4 || ' milliseconds')::INTERVAL, $5)
-       ON CONFLICT (unique_key) DO NOTHING`,
+    `INSERT INTO ${t.jobs} (id, queue, envelope, available_at)
+       VALUES ($1, $2, $3, NOW() + ($4 || ' milliseconds')::INTERVAL)`,
     [
       envelope.id,
       envelope.queue,
       JSON.stringify(envelope),
       String(delayMs),
-      envelope.uniqueKey ?? null,
     ],
   );
   return (res.rowCount ?? 0) > 0;
@@ -416,27 +426,60 @@ export class PostgresDriver implements QueueDriver {
     envelope: QueueEnvelope,
     opts: EnqueueOptions,
     lockKey: string,
-    _lockTtlMs: number,
+    lockTtlMs: number,
   ): Promise<boolean> {
     await this.#ensureReady();
-    // The unique constraint on `unique_key` gates duplicates atomically.
-    const inserted = await insertJob(
-      this.#pool,
-      this.#t,
-      { ...envelope, uniqueKey: lockKey },
-      opts.delay ?? 0,
-    );
-    if (inserted) {
+    // Hold a TTL-bounded row in the locks table so the dedupe window
+    // matches the requested lockTtlMs (the unique_key column on jobs would
+    // only dedupe until the row is deleted on completion, which is shorter
+    // than the documented contract).
+    const acquired = await this.#acquireUniqueLock(lockKey, lockTtlMs);
+    if (!acquired) return false;
+
+    try {
+      const inserted = await insertJob(
+        this.#pool,
+        this.#t,
+        envelope,
+        opts.delay ?? 0,
+      );
+      if (!inserted) {
+        await this.clearUniqueLock(lockKey);
+        return false;
+      }
       await this.#pool.query(`SELECT pg_notify($1, $2)`, [
         this.#t.notifyChannel,
         envelope.queue,
       ]);
+      return true;
+    } catch (err) {
+      await this.clearUniqueLock(lockKey).catch(() => {});
+      throw err;
     }
-    return inserted;
   }
 
-  async clearUniqueLock(_uniqueKey: string): Promise<void> {
-    // No-op: the unique row is already deleted when the job is reserved.
+  async clearUniqueLock(uniqueKey: string): Promise<void> {
+    await this.#ensureReady();
+    await this.#pool.query(
+      `DELETE FROM ${this.#t.locks} WHERE key = $1`,
+      [uniqueLockKey(uniqueKey)],
+    );
+  }
+
+  async #acquireUniqueLock(
+    uniqueKey: string,
+    ttlMs: number,
+  ): Promise<boolean> {
+    const res = await this.#pool.query(
+      `INSERT INTO ${this.#t.locks} (key, expires_at)
+         VALUES ($1, NOW() + ($2 || ' milliseconds')::INTERVAL)
+       ON CONFLICT (key) DO UPDATE
+         SET expires_at = EXCLUDED.expires_at
+         WHERE ${this.#t.locks}.expires_at <= NOW()
+       RETURNING key`,
+      [uniqueLockKey(uniqueKey), String(ttlMs)],
+    );
+    return (res.rowCount ?? 0) > 0;
   }
 
   listen(handler: (envelope: QueueEnvelope) => Promise<void>): Listener {
@@ -447,16 +490,20 @@ export class PostgresDriver implements QueueDriver {
       while (
         !this.#stopped && this.#inFlight < this.#opts.concurrency
       ) {
-        const envelope = await this.#reserveOne();
-        if (!envelope) break;
+        const reserved = await this.#reserveOne();
+        if (!reserved) break;
         this.#inFlight++;
         (async () => {
           try {
-            await handler(envelope);
+            await handler(reserved.envelope);
           } catch (_err) {
             // Worker.ts already handles errors. Anything reaching here is a
             // bug in the worker pipeline.
           } finally {
+            // Ack the reservation. The row is only removed once the handler
+            // has returned, so a worker crash leaves the row reserved and a
+            // peer can reclaim it after reserveTtlMs.
+            await this.#ackReservation(reserved.id).catch(() => {});
             this.#inFlight--;
             this.#wakeup();
           }
@@ -528,31 +575,45 @@ export class PostgresDriver implements QueueDriver {
     await this.#pool.end();
   }
 
-  async #reserveOne(): Promise<QueueEnvelope | null> {
+  async #reserveOne(): Promise<{ id: string; envelope: QueueEnvelope } | null> {
     const client = await this.#pool.connect();
     try {
       await client.query("BEGIN");
-      const res = await client.query<{ envelope: QueueEnvelope }>(
+      const res = await client.query<{ id: string; envelope: QueueEnvelope }>(
         `WITH next AS (
            SELECT id FROM ${this.#t.jobs}
-             WHERE reserved_at IS NULL AND available_at <= NOW()
+             WHERE available_at <= NOW()
+               AND (
+                 reserved_at IS NULL
+                 OR reserved_at <= NOW() - ($1::bigint * INTERVAL '1 millisecond')
+               )
              ORDER BY available_at
              LIMIT 1
              FOR UPDATE SKIP LOCKED
          )
-         DELETE FROM ${this.#t.jobs}
-           WHERE id IN (SELECT id FROM next)
-         RETURNING envelope`,
+         UPDATE ${this.#t.jobs} AS jobs
+            SET reserved_at = NOW()
+           FROM next
+          WHERE jobs.id = next.id
+         RETURNING jobs.id, jobs.envelope`,
+        [this.#opts.reserveTtlMs],
       );
       await client.query("COMMIT");
       if (res.rowCount === 0) return null;
-      return res.rows[0].envelope;
+      return { id: res.rows[0].id, envelope: res.rows[0].envelope };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
     } finally {
       client.release();
     }
+  }
+
+  async #ackReservation(id: string): Promise<void> {
+    await this.#pool.query(
+      `DELETE FROM ${this.#t.jobs} WHERE id = $1`,
+      [id],
+    );
   }
 
   async #startNotifyClient(): Promise<void> {

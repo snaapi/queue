@@ -14,7 +14,12 @@ export interface Listener {
 
 /** Backing-store specific operations for failed jobs. */
 export interface FailedJobDriver {
-  store(record: FailedJob): Promise<void>;
+  /**
+   * Persist a failed job. The original envelope is stored alongside the
+   * record so retry() can reconstruct the dispatch metadata
+   * (maxAttempts, backoffSchedule, uniqueKey/ttl, chain) accurately.
+   */
+  store(record: FailedJob, envelope: QueueEnvelope): Promise<void>;
   list(queue: string | undefined, limit: number): Promise<FailedJob[]>;
   get(id: string, queue: string): Promise<FailedJob | null>;
   /** Re-enqueue a failed job and remove it from the failed store. */

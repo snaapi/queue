@@ -10,6 +10,10 @@ import type {
   QueueDriver,
 } from "./types.ts";
 
+interface StoredFailedJob extends FailedJob {
+  envelope: QueueEnvelope;
+}
+
 class DenoKvFailedStore implements FailedJobDriver {
   #kv: Deno.Kv;
 
@@ -17,39 +21,32 @@ class DenoKvFailedStore implements FailedJobDriver {
     this.#kv = kv;
   }
 
-  async store(record: FailedJob): Promise<void> {
-    await this.#kv.set(Keys.failed(record.queue, record.id), record);
+  async store(record: FailedJob, envelope: QueueEnvelope): Promise<void> {
+    const stored: StoredFailedJob = { ...record, envelope };
+    await this.#kv.set(Keys.failed(record.queue, record.id), stored);
   }
 
   async list(queue: string | undefined, limit: number): Promise<FailedJob[]> {
     const prefix = queue ? Keys.failedPrefix(queue) : Keys.failedAll();
     const results: FailedJob[] = [];
-    for await (const entry of this.#kv.list<FailedJob>({ prefix }, { limit })) {
-      results.push(entry.value);
+    for await (
+      const entry of this.#kv.list<StoredFailedJob>({ prefix }, { limit })
+    ) {
+      results.push(stripEnvelope(entry.value));
     }
     return results;
   }
 
   async get(id: string, queue: string): Promise<FailedJob | null> {
-    const entry = await this.#kv.get<FailedJob>(Keys.failed(queue, id));
-    return entry.value;
+    const entry = await this.#kv.get<StoredFailedJob>(Keys.failed(queue, id));
+    return entry.value ? stripEnvelope(entry.value) : null;
   }
 
   async retry(id: string, queue: string): Promise<boolean> {
-    const entry = await this.#kv.get<FailedJob>(Keys.failed(queue, id));
+    const entry = await this.#kv.get<StoredFailedJob>(Keys.failed(queue, id));
     if (!entry.value) return false;
 
-    const record = entry.value;
-    const envelope: QueueEnvelope = {
-      __snaapi_queue: true,
-      id: crypto.randomUUID(),
-      jobName: record.jobName,
-      payload: record.payload,
-      queue: record.queue,
-      attempt: 1,
-      maxAttempts: record.attempts,
-      backoffSchedule: [1000, 5000, 30000],
-    };
+    const envelope = freshFromStored(entry.value);
 
     const result = await this.#kv.atomic()
       .check(entry)
@@ -63,21 +60,11 @@ class DenoKvFailedStore implements FailedJobDriver {
   async retryAll(queue: string): Promise<number> {
     let count = 0;
     for await (
-      const entry of this.#kv.list<FailedJob>({
+      const entry of this.#kv.list<StoredFailedJob>({
         prefix: Keys.failedPrefix(queue),
       })
     ) {
-      const record = entry.value;
-      const envelope: QueueEnvelope = {
-        __snaapi_queue: true,
-        id: crypto.randomUUID(),
-        jobName: record.jobName,
-        payload: record.payload,
-        queue: record.queue,
-        attempt: 1,
-        maxAttempts: record.attempts,
-        backoffSchedule: [1000, 5000, 30000],
-      };
+      const envelope = freshFromStored(entry.value);
       const result = await this.#kv.atomic()
         .check(entry)
         .enqueue(envelope)
@@ -101,6 +88,28 @@ class DenoKvFailedStore implements FailedJobDriver {
     }
     return count;
   }
+}
+
+function stripEnvelope(stored: StoredFailedJob): FailedJob {
+  const { envelope: _envelope, ...record } = stored;
+  return record;
+}
+
+function freshFromStored(stored: StoredFailedJob): QueueEnvelope {
+  const original = stored.envelope;
+  return {
+    __snaapi_queue: true,
+    id: crypto.randomUUID(),
+    jobName: original.jobName,
+    payload: original.payload,
+    queue: original.queue,
+    attempt: 1,
+    maxAttempts: original.maxAttempts,
+    backoffSchedule: original.backoffSchedule,
+    uniqueKey: original.uniqueKey,
+    uniqueTtl: original.uniqueTtl,
+    chain: original.chain,
+  };
 }
 
 class DenoKvLockDriver implements LockDriver {

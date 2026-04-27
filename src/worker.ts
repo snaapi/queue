@@ -106,5 +106,5 @@ async function storeFailed(
     failedAt: Date.now(),
     attempts: envelope.attempt,
   };
-  await driver.failed.store(record);
+  await driver.failed.store(record, envelope);
 }
