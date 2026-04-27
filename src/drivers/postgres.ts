@@ -341,14 +341,15 @@ async function insertJob(
   envelope: QueueEnvelope,
   delayMs: number,
 ): Promise<boolean> {
-  // unique_key is intentionally NULL: dedup is enforced via the locks table
-  // (see PostgresDriver.enqueueUnique). Keeping the column NULL means a
-  // retry insert never collides with the still-reserved original row.
+  // The row PK is independent of envelope.id so a mid-flight retry
+  // (which keeps the same envelope.id) does not collide with the
+  // still-reserved original row. unique_key is NULL because dedup is
+  // enforced via the locks table; see PostgresDriver.enqueueUnique.
   const res = await client.query(
     `INSERT INTO ${t.jobs} (id, queue, envelope, available_at)
        VALUES ($1, $2, $3, NOW() + ($4 || ' milliseconds')::INTERVAL)`,
     [
-      envelope.id,
+      crypto.randomUUID(),
       envelope.queue,
       JSON.stringify(envelope),
       String(delayMs),
