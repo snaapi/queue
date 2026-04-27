@@ -8,6 +8,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: queue
+          POSTGRES_PASSWORD: queue
+          POSTGRES_DB: queue
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U queue -d queue"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://queue:queue@localhost:5432/queue
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -26,5 +42,8 @@ jobs:
       - name: Type check
         run: deno task check
 
-      - name: Test
+      - name: Test (Deno KV)
         run: deno task test
+
+      - name: Test (Postgres)
+        run: deno task test:pg

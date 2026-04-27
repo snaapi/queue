@@ -3,18 +3,21 @@ import { PendingDispatch } from "./dispatcher.ts";
 import { FailedJobStore } from "./failed.ts";
 import { dispatchChain } from "./chain.ts";
 import { createListener } from "./worker.ts";
+import type { Listener, QueueDriver } from "./drivers/types.ts";
+import { DenoKvDriver } from "./drivers/deno-kv.ts";
 
 /** The main queue interface. Register jobs, dispatch work, and start listening. */
 export class Queue {
-  #kv: Deno.Kv;
+  #driver: QueueDriver;
   #handlers = new Map<string, JobHandler>();
   #middlewareMap = new Map<string, JobMiddleware[]>();
   #globalMiddleware: JobMiddleware[] = [];
   #failedStore: FailedJobStore;
+  #listener?: Listener;
 
-  constructor(kv: Deno.Kv) {
-    this.#kv = kv;
-    this.#failedStore = new FailedJobStore(kv);
+  constructor(backing: Deno.Kv | QueueDriver) {
+    this.#driver = isDriver(backing) ? backing : new DenoKvDriver(backing);
+    this.#failedStore = new FailedJobStore(this.#driver);
   }
 
   /** Register a named job handler. */
@@ -36,29 +39,52 @@ export class Queue {
     return this;
   }
 
-  /** Dispatch a job. Returns a chainable builder — call .send() to enqueue. */
+  /** Dispatch a job. Returns a chainable builder. Call .send() to enqueue. */
   dispatch<T>(jobName: string, payload: T): PendingDispatch {
-    return new PendingDispatch(this.#kv, jobName, payload);
+    return new PendingDispatch(this.#driver, jobName, payload);
   }
 
   /** Dispatch a chain of jobs to run sequentially. */
   async chain(steps: JobChainStep[]): Promise<void> {
-    await dispatchChain(this.#kv, steps);
+    await dispatchChain(this.#driver, steps);
   }
 
   /** Start listening for queue messages. Call once per worker process. */
   listen(): void {
-    const listener = createListener({
-      kv: this.#kv,
+    const handler = createListener({
+      driver: this.#driver,
       handlers: this.#handlers,
       middlewareMap: this.#middlewareMap,
       globalMiddleware: this.#globalMiddleware,
     });
-    this.#kv.listenQueue(listener);
+    this.#listener = this.#driver.listen(handler);
+  }
+
+  /** Stop the listener and release driver resources. */
+  async close(): Promise<void> {
+    if (this.#listener) {
+      await this.#listener.stop();
+      this.#listener = undefined;
+    }
+    await this.#driver.close();
   }
 
   /** Access the failed job store for inspection and retry. */
   get failed(): FailedJobStore {
     return this.#failedStore;
   }
+
+  /** Underlying driver. Exposed for advanced use cases. */
+  get driver(): QueueDriver {
+    return this.#driver;
+  }
+}
+
+function isDriver(value: unknown): value is QueueDriver {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as QueueDriver).enqueue === "function" &&
+    typeof (value as QueueDriver).listen === "function"
+  );
 }

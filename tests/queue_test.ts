@@ -78,7 +78,8 @@ Deno.test("job context is populated correctly", async () => {
           maxAttempts: ctx.maxAttempts,
           queue: ctx.queue,
           hasId: typeof ctx.id === "string" && ctx.id.length > 0,
-          hasKv: ctx.kv !== undefined,
+          hasLocks: typeof ctx.locks?.acquire === "function",
+          hasCounters: typeof ctx.counters?.increment === "function",
         };
         done.resolve();
       },
@@ -97,7 +98,8 @@ Deno.test("job context is populated correctly", async () => {
     assertEquals(capturedCtx.maxAttempts, 5);
     assertEquals(capturedCtx.queue, "high");
     assertEquals(capturedCtx.hasId, true);
-    assertEquals(capturedCtx.hasKv, true);
+    assertEquals(capturedCtx.hasLocks, true);
+    assertEquals(capturedCtx.hasCounters, true);
   });
 });
 

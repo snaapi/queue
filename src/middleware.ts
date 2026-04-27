@@ -1,5 +1,4 @@
 import type { JobContext, JobMiddleware } from "./types.ts";
-import { Keys } from "./keys.ts";
 
 /** Execute a middleware chain, then the final handler. */
 export async function runMiddlewareChain(
@@ -20,61 +19,36 @@ export async function runMiddlewareChain(
   await next();
 }
 
-/** Rate-limit job execution within a time window using KV counters. */
+/** Rate-limit job execution within a time window. */
 export function rateLimit(opts: {
   key: string;
   maxPerWindow: number;
   windowMs: number;
 }): JobMiddleware {
   return async (ctx, _payload, next) => {
-    const windowKey = [
-      "snaapi_queue",
-      "ratelimit",
-      opts.key,
-      Math.floor(Date.now() / opts.windowMs),
-    ];
-    const counter = await ctx.kv.get<Deno.KvU64>(windowKey);
-    const current = counter.value ? Number(counter.value) : 0;
-
-    if (current >= opts.maxPerWindow) {
+    const count = await ctx.counters.increment(opts.key, opts.windowMs);
+    if (count > opts.maxPerWindow) {
       throw new Error(
-        `Rate limit exceeded for "${opts.key}": ${current}/${opts.maxPerWindow}`,
+        `Rate limit exceeded for "${opts.key}": ${count}/${opts.maxPerWindow}`,
       );
     }
-
-    const atomic = ctx.kv.atomic()
-      .sum(windowKey, 1n)
-      .commit();
-    await atomic;
     await next();
   };
 }
 
-/** Prevent overlapping execution of a job. Acquires a KV lock, skips if already held. */
+/** Prevent overlapping execution of a job. Skips silently if the lock is held. */
 export function withoutOverlapping(opts: {
   key: string;
   expiresIn?: number;
 }): JobMiddleware {
-  const ttl = opts.expiresIn ?? 300_000; // 5 min default
-
+  const ttl = opts.expiresIn ?? 300_000;
   return async (ctx, _payload, next) => {
-    const lockKey = Keys.unique(`overlap:${opts.key}`);
-
-    // Try to acquire lock atomically — only succeeds if key doesn't exist
-    const result = await ctx.kv.atomic()
-      .check({ key: lockKey, versionstamp: null })
-      .set(lockKey, true, { expireIn: ttl })
-      .commit();
-
-    if (!result.ok) {
-      // Lock held — skip this execution silently
-      return;
-    }
-
+    const acquired = await ctx.locks.acquire(opts.key, ttl);
+    if (!acquired) return;
     try {
       await next();
     } finally {
-      await ctx.kv.delete(lockKey);
+      await ctx.locks.release(opts.key);
     }
   };
 }
