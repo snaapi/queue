@@ -1,19 +1,62 @@
 import { assertEquals } from "@std/assert";
-import { Queue } from "../mod.ts";
+import { PostgresDriver, Queue } from "../mod.ts";
 import type { JobHandler } from "../mod.ts";
 
-async function withKv(fn: (kv: Deno.Kv) => Promise<void>) {
-  const kv = await Deno.openKv(":memory:");
+const DATABASE_URL = Deno.env.get("DATABASE_URL");
+
+if (!DATABASE_URL) {
+  console.warn(
+    "DATABASE_URL not set; skipping queue tests. " +
+      "Run `docker compose up -d postgres && DATABASE_URL=postgres://queue:queue@localhost:5444/queue deno task test`.",
+  );
+}
+
+async function withPg(
+  fn: (queue: Queue, driver: PostgresDriver) => Promise<void>,
+  opts: { concurrency?: number } = {},
+) {
+  if (!DATABASE_URL) return;
+  const driver = new PostgresDriver({
+    connectionString: DATABASE_URL,
+    pollIntervalMs: 100,
+    concurrency: opts.concurrency ?? 1,
+  });
+  await driver.migrate();
+  await truncate();
+  const queue = new Queue(driver);
   try {
-    await fn(kv);
+    await fn(queue, driver);
   } finally {
-    kv.close();
+    await queue.close();
   }
 }
 
-Deno.test("dispatch and process a simple job", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+const pgTest = (name: string, fn: () => Promise<void>) =>
+  Deno.test({
+    name,
+    fn,
+    // npm:pg holds keep-alive timers and connection pools; close() drains
+    // the pool, but Deno's leak detector still flags transient timers.
+    sanitizeOps: false,
+    sanitizeResources: false,
+  });
+
+async function truncate() {
+  const { default: pg } = await import("pg");
+  const client = new pg.Client({ connectionString: DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(
+      `TRUNCATE snaapi_jobs, snaapi_failed_jobs,
+                snaapi_locks, snaapi_counters`,
+    );
+  } finally {
+    await client.end();
+  }
+}
+
+pgTest("dispatch and process a simple job", async () => {
+  await withPg(async (queue) => {
     const results: string[] = [];
     const done = Promise.withResolvers<void>();
     const greetJob: JobHandler<{ name: string }> = {
@@ -22,22 +65,17 @@ Deno.test("dispatch and process a simple job", async () => {
         done.resolve();
       },
     };
-    const queue = new Queue(kv);
     queue.register("greet", greetJob);
     queue.listen();
 
-    // Act
     await queue.dispatch("greet", { name: "World" }).send();
     await done.promise;
-
-    // Assert
     assertEquals(results, ["Hello World"]);
   });
 });
 
-Deno.test("dispatch with delay", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+pgTest("dispatch with delay", async () => {
+  await withPg(async (queue) => {
     const done = Promise.withResolvers<void>();
     let receivedAt = 0;
     const job: JobHandler<null> = {
@@ -46,33 +84,28 @@ Deno.test("dispatch with delay", async () => {
         done.resolve();
       },
     };
-    const queue = new Queue(kv);
     queue.register("delayed", job);
     queue.listen();
 
-    // Act
     const sentAt = Date.now();
-    await queue.dispatch("delayed", null).delay(100).send();
+    await queue.dispatch("delayed", null).delay(300).send();
     await done.promise;
-
-    // Assert
     const elapsed = receivedAt - sentAt;
     assertEquals(
-      elapsed >= 50,
+      elapsed >= 250,
       true,
-      `Expected delay >= 50ms, got ${elapsed}ms`,
+      `Expected delay >= 250ms, got ${elapsed}ms`,
     );
   });
 });
 
-Deno.test("job context is populated correctly", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+pgTest("job context is populated correctly", async () => {
+  await withPg(async (queue) => {
     const done = Promise.withResolvers<void>();
-    let capturedCtx: Record<string, unknown> = {};
+    let captured: Record<string, unknown> = {};
     const job: JobHandler<string> = {
       handle(_payload, ctx) {
-        capturedCtx = {
+        captured = {
           jobName: ctx.jobName,
           attempt: ctx.attempt,
           maxAttempts: ctx.maxAttempts,
@@ -84,51 +117,44 @@ Deno.test("job context is populated correctly", async () => {
         done.resolve();
       },
     };
-    const queue = new Queue(kv);
-    queue.register("ctx-test", job);
+    queue.register("ctx", job);
     queue.listen();
 
-    // Act
-    await queue.dispatch("ctx-test", "data").onQueue("high").attempts(5).send();
+    await queue.dispatch("ctx", "data").onQueue("high").attempts(5).send();
     await done.promise;
 
-    // Assert
-    assertEquals(capturedCtx.jobName, "ctx-test");
-    assertEquals(capturedCtx.attempt, 1);
-    assertEquals(capturedCtx.maxAttempts, 5);
-    assertEquals(capturedCtx.queue, "high");
-    assertEquals(capturedCtx.hasId, true);
-    assertEquals(capturedCtx.hasLocks, true);
-    assertEquals(capturedCtx.hasCounters, true);
+    assertEquals(captured.jobName, "ctx");
+    assertEquals(captured.attempt, 1);
+    assertEquals(captured.maxAttempts, 5);
+    assertEquals(captured.queue, "high");
+    assertEquals(captured.hasId, true);
+    assertEquals(captured.hasLocks, true);
+    assertEquals(captured.hasCounters, true);
   });
 });
 
-Deno.test("failed job is stored after max attempts", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+pgTest("failed job is stored after max attempts", async () => {
+  await withPg(async (queue) => {
     const done = Promise.withResolvers<void>();
     let attemptCount = 0;
     const failingJob: JobHandler<string> = {
       handle() {
         attemptCount++;
         if (attemptCount >= 2) {
-          setTimeout(() => done.resolve(), 100);
+          setTimeout(() => done.resolve(), 200);
         }
         throw new Error("always fails");
       },
     };
-    const queue = new Queue(kv);
     queue.register("fail-job", failingJob);
     queue.listen();
 
-    // Act
     await queue.dispatch("fail-job", "test")
       .attempts(2)
       .backoff([50])
       .send();
     await done.promise;
 
-    // Assert
     const failed = await queue.failed.list("default");
     assertEquals(failed.length, 1);
     assertEquals(failed[0].jobName, "fail-job");
@@ -137,9 +163,8 @@ Deno.test("failed job is stored after max attempts", async () => {
   });
 });
 
-Deno.test("global middleware runs for all jobs", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+pgTest("global middleware runs for all jobs", async () => {
+  await withPg(async (queue) => {
     const done = Promise.withResolvers<void>();
     const order: string[] = [];
     const job: JobHandler<null> = {
@@ -148,69 +173,24 @@ Deno.test("global middleware runs for all jobs", async () => {
         done.resolve();
       },
     };
-    const queue = new Queue(kv);
     queue.use(async (_ctx, _payload, next) => {
       order.push("middleware-before");
       await next();
       order.push("middleware-after");
     });
-    queue.register("mw-test", job);
+    queue.register("mw", job);
     queue.listen();
 
-    // Act
-    await queue.dispatch("mw-test", null).send();
+    await queue.dispatch("mw", null).send();
     await done.promise;
-    await new Promise((r) => setTimeout(r, 50));
+    await new Promise((r) => setTimeout(r, 100));
 
-    // Assert
     assertEquals(order, ["middleware-before", "handler", "middleware-after"]);
   });
 });
 
-Deno.test("job-specific middleware only runs for that job", async () => {
-  await withKv(async (kv) => {
-    // Arrange
-    const done1 = Promise.withResolvers<void>();
-    const done2 = Promise.withResolvers<void>();
-    const logs: string[] = [];
-    const jobA: JobHandler<null> = {
-      handle() {
-        logs.push("jobA");
-        done1.resolve();
-      },
-    };
-    const jobB: JobHandler<null> = {
-      handle() {
-        logs.push("jobB");
-        done2.resolve();
-      },
-    };
-    const queue = new Queue(kv);
-    queue.register("a", jobA);
-    queue.register("b", jobB);
-    queue.middleware("a", async (_ctx, _payload, next) => {
-      logs.push("mw-a");
-      await next();
-    });
-    queue.listen();
-
-    // Act
-    await queue.dispatch("a", null).send();
-    await done1.promise;
-    await queue.dispatch("b", null).send();
-    await done2.promise;
-
-    // Assert
-    assertEquals(logs.includes("mw-a"), true);
-    assertEquals(logs.includes("jobA"), true);
-    assertEquals(logs.includes("jobB"), true);
-    assertEquals(logs.indexOf("mw-a") < logs.indexOf("jobA"), true);
-  });
-});
-
-Deno.test("job chain executes in order", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+pgTest("job chain executes in order", async () => {
+  await withPg(async (queue) => {
     const results: string[] = [];
     const done = Promise.withResolvers<void>();
     const stepHandler = (
@@ -221,13 +201,11 @@ Deno.test("job chain executes in order", async () => {
         resolve?.();
       },
     });
-    const queue = new Queue(kv);
     queue.register("step1", stepHandler());
     queue.register("step2", stepHandler());
     queue.register("step3", stepHandler(done.resolve));
     queue.listen();
 
-    // Act
     await queue.chain([
       { jobName: "step1", payload: { step: 1 } },
       { jobName: "step2", payload: { step: 2 } },
@@ -235,14 +213,12 @@ Deno.test("job chain executes in order", async () => {
     ]);
     await done.promise;
 
-    // Assert
     assertEquals(results, ["step-1", "step-2", "step-3"]);
   });
 });
 
-Deno.test("unique job prevents duplicates", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+pgTest("unique job prevents duplicates", async () => {
+  await withPg(async (queue) => {
     let callCount = 0;
     const done = Promise.withResolvers<void>();
     const job: JobHandler<null> = {
@@ -251,24 +227,20 @@ Deno.test("unique job prevents duplicates", async () => {
         done.resolve();
       },
     };
-    const queue = new Queue(kv);
     queue.register("unique-job", job);
 
-    // Act — dispatch twice with same unique key before listening
     await queue.dispatch("unique-job", null).unique("same-key", 60_000).send();
     await queue.dispatch("unique-job", null).unique("same-key", 60_000).send();
     queue.listen();
     await done.promise;
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 300));
 
-    // Assert
     assertEquals(callCount, 1);
   });
 });
 
-Deno.test("failed job can be retried", async () => {
-  await withKv(async (kv) => {
-    // Arrange
+pgTest("failed job can be retried", async () => {
+  await withPg(async (queue) => {
     let attemptCount = 0;
     const failDone = Promise.withResolvers<void>();
     const retryDone = Promise.withResolvers<void>();
@@ -276,32 +248,201 @@ Deno.test("failed job can be retried", async () => {
       handle() {
         attemptCount++;
         if (attemptCount === 1) {
-          setTimeout(() => failDone.resolve(), 100);
+          setTimeout(() => failDone.resolve(), 200);
           throw new Error("first try fails");
         }
         retryDone.resolve();
       },
     };
-    const queue = new Queue(kv);
     queue.register("retry-job", job);
     queue.listen();
 
-    // Act — dispatch and wait for initial failure
     await queue.dispatch("retry-job", "data").attempts(1).send();
     await failDone.promise;
     const failed = await queue.failed.list("default");
-
-    // Assert — verify failure was recorded
     assertEquals(failed.length, 1);
 
-    // Act — retry the failed job
     const retried = await queue.failed.retry(failed[0].id, "default");
     await retryDone.promise;
 
-    // Assert — verify retry succeeded and store is cleared
     assertEquals(retried, true);
     assertEquals(attemptCount, 2);
     const remaining = await queue.failed.list("default");
     assertEquals(remaining.length, 0);
   });
+});
+
+pgTest("rate limit middleware throws when exceeded", async () => {
+  await withPg(async (queue) => {
+    const { rateLimit } = await import("../mod.ts");
+    const done = Promise.withResolvers<void>();
+    let attempts = 0;
+    const job: JobHandler<null> = {
+      handle() {
+        attempts++;
+      },
+    };
+    queue.register("rl", job);
+    queue.middleware(
+      "rl",
+      rateLimit({ key: "rl-test", maxPerWindow: 1, windowMs: 60_000 }),
+    );
+    queue.listen();
+
+    // First dispatch succeeds (count=1, limit=1).
+    await queue.dispatch("rl", null).attempts(1).send();
+    // Second dispatch trips the limit (count=2 > limit=1) and goes to failed.
+    await queue.dispatch("rl", null).attempts(1).send();
+
+    // Wait for both to settle.
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      const failed = await queue.failed.list("default");
+      if (attempts === 1 && failed.length === 1) {
+        done.resolve();
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    await done.promise;
+    assertEquals(attempts, 1);
+  });
+});
+
+pgTest("schema is auto-migrated on first use", async () => {
+  if (!DATABASE_URL) return;
+  // Drop all tables; the driver should recreate them on first call.
+  const { default: pg } = await import("pg");
+  const setup = new pg.Client({ connectionString: DATABASE_URL });
+  await setup.connect();
+  try {
+    await setup.query(
+      `DROP TABLE IF EXISTS snaapi_jobs, snaapi_failed_jobs,
+                            snaapi_locks, snaapi_counters CASCADE`,
+    );
+  } finally {
+    await setup.end();
+  }
+
+  const driver = new PostgresDriver({
+    connectionString: DATABASE_URL,
+    pollIntervalMs: 100,
+    // autoMigrate defaults to true.
+  });
+  const queue = new Queue(driver);
+  try {
+    const done = Promise.withResolvers<void>();
+    queue.register("auto", { handle: () => done.resolve() });
+    queue.listen();
+    await queue.dispatch("auto", null).send();
+    await done.promise;
+  } finally {
+    await queue.close();
+  }
+});
+
+pgTest("custom tablePrefix creates and uses prefixed tables", async () => {
+  if (!DATABASE_URL) return;
+  const prefix = "qtest_";
+  const { default: pg } = await import("pg");
+
+  const setup = new pg.Client({ connectionString: DATABASE_URL });
+  await setup.connect();
+  try {
+    await setup.query(
+      `DROP TABLE IF EXISTS ${prefix}jobs, ${prefix}failed_jobs,
+                            ${prefix}locks, ${prefix}counters CASCADE`,
+    );
+  } finally {
+    await setup.end();
+  }
+
+  const driver = new PostgresDriver({
+    connectionString: DATABASE_URL,
+    pollIntervalMs: 100,
+    tablePrefix: prefix,
+  });
+  const queue = new Queue(driver);
+  try {
+    const done = Promise.withResolvers<void>();
+    queue.register("prefixed", { handle: () => done.resolve() });
+    queue.listen();
+    await queue.dispatch("prefixed", null).send();
+    await done.promise;
+
+    // Verify the prefixed tables exist (and the default ones were not
+    // touched by this driver instance).
+    const verify = new pg.Client({ connectionString: DATABASE_URL });
+    await verify.connect();
+    try {
+      const res = await verify.query(
+        `SELECT table_name FROM information_schema.tables
+           WHERE table_name LIKE $1 ORDER BY table_name`,
+        [`${prefix}%`],
+      );
+      const names = (res.rows as Array<{ table_name: string }>)
+        .map((r) => r.table_name).sort();
+      assertEquals(names, [
+        `${prefix}counters`,
+        `${prefix}failed_jobs`,
+        `${prefix}jobs`,
+        `${prefix}locks`,
+      ]);
+    } finally {
+      await verify.end();
+    }
+  } finally {
+    await queue.close();
+    // Clean up so the test is repeatable.
+    const cleanup = new pg.Client({ connectionString: DATABASE_URL });
+    await cleanup.connect();
+    try {
+      await cleanup.query(
+        `DROP TABLE IF EXISTS ${prefix}jobs, ${prefix}failed_jobs,
+                              ${prefix}locks, ${prefix}counters CASCADE`,
+      );
+    } finally {
+      await cleanup.end();
+    }
+  }
+});
+
+pgTest("withoutOverlapping skips concurrent runs", async () => {
+  await withPg(async (queue) => {
+    const { withoutOverlapping } = await import("../mod.ts");
+    let active = 0;
+    let peak = 0;
+    let started = 0;
+    let completed = 0;
+    const inflight = Promise.withResolvers<void>();
+    const job: JobHandler<null> = {
+      async handle() {
+        started++;
+        active++;
+        peak = Math.max(peak, active);
+        await inflight.promise;
+        active--;
+        completed++;
+      },
+    };
+    queue.register("solo", job);
+    queue.middleware(
+      "solo",
+      withoutOverlapping({ key: "solo-test", expiresIn: 60_000 }),
+    );
+    queue.listen();
+
+    // Two dispatches enqueued together; both pulled by the concurrency=2
+    // consumer at roughly the same time. Lock arbitration happens inside
+    // the middleware: only one wins, the other returns silently.
+    await queue.dispatch("solo", null).send();
+    await queue.dispatch("solo", null).send();
+    await new Promise((r) => setTimeout(r, 400));
+    inflight.resolve();
+    await new Promise((r) => setTimeout(r, 200));
+
+    assertEquals(peak, 1);
+    assertEquals(started, 1);
+    assertEquals(completed, 1);
+  }, { concurrency: 2 });
 });

@@ -42,8 +42,5 @@ jobs:
       - name: Type check
         run: deno task check
 
-      - name: Test (Deno KV)
+      - name: Test
         run: deno task test
-
-      - name: Test (Postgres)
-        run: deno task test:pg

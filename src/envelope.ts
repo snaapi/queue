@@ -1,6 +1,6 @@
 import type { JobChainStep } from "./types.ts";
 
-/** The message envelope serialized into Deno KV queue. */
+/** The message envelope persisted into the queue store. */
 export interface QueueEnvelope {
   /** Discriminator so the listener knows this message belongs to us */
   __snaapi_queue: true;

@@ -1,26 +1,26 @@
 # @snaapi/queue
 
-A job queue for Deno that runs on either Postgres (default) or Deno KV. Postgres
-is the recommended driver for Deno Deploy and any environment where KV Connect
-blocks `enqueue`. The Deno KV driver remains available with no external
-dependencies.
+A Postgres backed job queue for Deno. Designed for Deno Deploy and any
+environment where you need durable, multi worker job processing. Uses
+`LISTEN`/`NOTIFY` for low latency wakeups and `SELECT FOR UPDATE SKIP LOCKED`
+for safe concurrent reservation.
 
 ## Install
 
 ```ts
-import { Queue } from "@snaapi/queue";
+import { PostgresDriver, Queue } from "@snaapi/queue";
 ```
 
 ## Quick Start
 
 ```ts
-import { createQueue } from "@snaapi/queue";
+import { PostgresDriver, Queue } from "@snaapi/queue";
 import type { JobHandler } from "@snaapi/queue";
 
-// Reads DATABASE_URL from the environment. Postgres is the default driver.
-// The schema is auto-created on first use. See "Backing Stores" for the
-// Deno KV alternative.
-const queue = await createQueue();
+const driver = new PostgresDriver({
+  connectionString: Deno.env.get("DATABASE_URL")!,
+});
+const queue = new Queue(driver);
 
 const sendEmail: JobHandler<{ to: string; subject: string }> = {
   handle(payload, ctx) {
@@ -42,27 +42,9 @@ await queue.dispatch("send-email", {
 Note that `queue.listen()` attaches to the backing store and must run in the
 same long lived process. A script that only dispatches jobs and then exits will
 enqueue work, but nothing will consume it until a process with `listen()` is
-running against the same store.
+running against the same database.
 
-## Backing Stores
-
-The queue runs on either Postgres (default for `createQueue()`) or Deno KV. The
-same `Queue` API works against both. Wire a driver explicitly with
-`new Queue(driver)` or let `createQueue()` read the environment.
-
-### Postgres (default)
-
-```ts
-import { createQueue } from "@snaapi/queue";
-
-// Reads DATABASE_URL from the environment.
-// QUEUE_DRIVER defaults to "postgres". Set QUEUE_DRIVER=deno-kv to opt out.
-const queue = await createQueue();
-queue.register("send-email", sendEmail);
-queue.listen();
-```
-
-Or wire it explicitly:
+## Driver
 
 ```ts
 import { PostgresDriver, Queue } from "@snaapi/queue";
@@ -71,17 +53,20 @@ const driver = new PostgresDriver({
   connectionString: Deno.env.get("DATABASE_URL")!,
   pollIntervalMs: 1000, // fallback when LISTEN/NOTIFY misses (default 1000)
   concurrency: 1, // in-flight jobs per listener (default 1)
+  reserveTtlMs: 5 * 60_000, // how long a worker can hold a job before peers can reclaim it
   tablePrefix: "snaapi_", // see "Table prefix" below
 });
 const queue = new Queue(driver);
 ```
 
-The Postgres driver wakes up via `LISTEN`/`NOTIFY` when a new job is enqueued
-and falls back to a polling timer for delayed jobs. Multiple worker processes
-can `listen()` against the same database. `SELECT FOR UPDATE SKIP LOCKED`
-ensures each job is delivered to exactly one worker.
+The driver wakes up via `LISTEN`/`NOTIFY` when a new job is enqueued and falls
+back to a polling timer for delayed jobs. Multiple worker processes can
+`listen()` against the same database. `SELECT FOR UPDATE SKIP LOCKED` ensures
+each ready job is reserved by exactly one worker. Reserved jobs are deleted only
+after the handler returns, so a worker crash leaves the row reserved until
+`reserveTtlMs` elapses, at which point a peer can reclaim it.
 
-#### Auto migration
+### Auto migration
 
 The Postgres driver runs `migrate()` lazily on first use. The schema is
 idempotent (`CREATE TABLE IF NOT EXISTS`), so it is safe to leave on across
@@ -102,7 +87,7 @@ The standalone task is also available:
 DATABASE_URL=postgres://... deno task db:migrate
 ```
 
-#### Table prefix
+### Table prefix
 
 By default the driver creates four tables: `snaapi_jobs`, `snaapi_failed_jobs`,
 `snaapi_locks`, `snaapi_counters`. The prefix (default `snaapi_`) is
@@ -117,49 +102,23 @@ new PostgresDriver({
 });
 ```
 
-#### Local development
+### Local development
 
 A `compose.yaml` ships with the project:
 
 ```bash
 docker compose up -d postgres
 export DATABASE_URL=postgres://queue:queue@localhost:5444/queue
-deno task test:pg
+deno task test
 ```
-
-### Deno KV
-
-```ts
-import { Queue } from "@snaapi/queue";
-const kv = await Deno.openKv();
-const queue = new Queue(kv);
-```
-
-Use this when running locally, on a VPS, or anywhere a writable Deno KV file is
-available. Deno Deploy uses KV Connect for hosted KV, which does not support
-`enqueue`, so reach for the Postgres driver in that environment.
-
-### Switching drivers
-
-1. Stop your workers.
-2. Drain the queue (let in-flight jobs finish, then verify the source store is
-   empty).
-3. Update `QUEUE_DRIVER` (and `DATABASE_URL` for Postgres) in your environment.
-   Postgres is the factory default; set `QUEUE_DRIVER=deno-kv` to opt out.
-4. If switching to Postgres, the schema migrates automatically on first use. You
-   can also run `deno task db:migrate` ahead of time.
-5. Restart workers.
-
-Pending jobs do not migrate between stores. If you have queued work that must be
-preserved, drain it before switching.
 
 ### Migrating from 1.x
 
 Versions before 2.0 took a `Deno.Kv` directly and exposed `ctx.kv` to handlers.
-The constructor still accepts a `Deno.Kv` for backward compatibility, but
-`ctx.kv` is no longer exposed. Custom middleware that read `ctx.kv` should use
-the new `ctx.locks` and `ctx.counters` primitives, which work across both
-backing stores.
+The 2.x line drops Deno KV support entirely (KV Connect on Deno Deploy does not
+support `enqueue`). Pass a `PostgresDriver` to the `Queue` constructor and use
+`ctx.locks` / `ctx.counters` from middleware instead of `ctx.kv`. Pending jobs
+do not migrate between stores; drain the KV queue before cutting over.
 
 ## Dispatch Options
 

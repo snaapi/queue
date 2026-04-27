@@ -4,7 +4,6 @@ import { FailedJobStore } from "./failed.ts";
 import { dispatchChain } from "./chain.ts";
 import { createListener } from "./worker.ts";
 import type { Listener, QueueDriver } from "./drivers/types.ts";
-import { DenoKvDriver } from "./drivers/deno-kv.ts";
 
 /** The main queue interface. Register jobs, dispatch work, and start listening. */
 export class Queue {
@@ -15,8 +14,8 @@ export class Queue {
   #failedStore: FailedJobStore;
   #listener?: Listener;
 
-  constructor(backing: Deno.Kv | QueueDriver) {
-    this.#driver = isDriver(backing) ? backing : new DenoKvDriver(backing);
+  constructor(driver: QueueDriver) {
+    this.#driver = driver;
     this.#failedStore = new FailedJobStore(this.#driver);
   }
 
@@ -78,13 +77,4 @@ export class Queue {
   get driver(): QueueDriver {
     return this.#driver;
   }
-}
-
-function isDriver(value: unknown): value is QueueDriver {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as QueueDriver).enqueue === "function" &&
-    typeof (value as QueueDriver).listen === "function"
-  );
 }

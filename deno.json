@@ -4,9 +4,7 @@
   "exports": "./mod.ts",
   "tasks": {
     "check": "deno check mod.ts",
-    "test": "deno test --unstable-kv -A tests/queue_test.ts",
-    "test:pg": "deno test --unstable-kv -A tests/postgres_test.ts",
-    "test:all": "deno test --unstable-kv -A",
+    "test": "deno test -A tests/queue_test.ts",
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose down",
     "db:migrate": "deno run -A scripts/migrate.ts",
