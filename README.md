@@ -102,6 +102,23 @@ new PostgresDriver({
 });
 ```
 
+### Worker error handling
+
+The polling loop catches driver errors (connection refused, transient network
+failures) and backs off (capped at 30 seconds) instead of letting the rejection
+escape and crash the host process. Errors are written to `console.error` by
+default. Pass an `onError` callback to route them to your own logger or metrics
+pipeline.
+
+```ts
+const driver = new PostgresDriver({
+  connectionString: Deno.env.get("DATABASE_URL")!,
+  onError: (err) => log.warn({ err }, "queue worker error"),
+});
+```
+
+Call `await queue.close()` to stop the worker cleanly.
+
 ### Local development
 
 A `compose.yaml` ships with the project:

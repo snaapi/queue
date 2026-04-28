@@ -18,6 +18,7 @@ type Client = pg.Client;
 const DEFAULT_POLL_INTERVAL = 1000;
 const DEFAULT_RESERVE_TTL = 5 * 60_000;
 const DEFAULT_TABLE_PREFIX = "snaapi_";
+const MAX_BACKOFF_MS = 30_000;
 
 export interface PostgresDriverOptions {
   /** Postgres connection string (e.g. postgres://user:pass@host:5432/db). */
@@ -42,6 +43,13 @@ export interface PostgresDriverOptions {
    * the schema yourself or run migrations as a separate deploy step.
    */
   autoMigrate?: boolean;
+  /**
+   * Invoked when the worker loop encounters an error (e.g. transient DB
+   * connection failure). The loop logs and backs off rather than letting
+   * the rejection escape, so the host process stays up. When unset, errors
+   * are written to `console.error`.
+   */
+  onError?: (err: unknown) => void;
 }
 
 interface TableNames {
@@ -361,9 +369,14 @@ async function insertJob(
 /** Postgres implementation of `QueueDriver`. */
 export class PostgresDriver implements QueueDriver {
   #pool: Pool;
-  #opts: Required<
-    Omit<PostgresDriverOptions, "connectionString" | "tablePrefix">
-  >;
+  #opts:
+    & Required<
+      Omit<
+        PostgresDriverOptions,
+        "connectionString" | "tablePrefix" | "onError"
+      >
+    >
+    & { onError?: (err: unknown) => void };
   #connectionString: string;
   #t: TableNames;
   #migrationPromise?: Promise<void>;
@@ -385,6 +398,7 @@ export class PostgresDriver implements QueueDriver {
       reserveTtlMs: opts.reserveTtlMs ?? DEFAULT_RESERVE_TTL,
       poolSize: opts.poolSize ?? 10,
       autoMigrate: opts.autoMigrate ?? true,
+      onError: opts.onError,
     };
     this.#t = tableNamesFor(resolvePrefix(opts));
     this.#pool = new Pool({
@@ -513,15 +527,31 @@ export class PostgresDriver implements QueueDriver {
     };
 
     const loop = async () => {
-      // Make sure tables exist before we try to SELECT from them.
+      // Errors here are reported by the inner catch on the next iteration.
       await this.#ensureReady().catch(() => {});
+      let backoffMs = this.#opts.pollIntervalMs;
       while (!this.#stopped) {
-        await drainOnce();
+        let waitMs = this.#opts.pollIntervalMs;
+        try {
+          await drainOnce();
+          backoffMs = this.#opts.pollIntervalMs;
+        } catch (err) {
+          // Without this catch, driver errors (connection refused, network
+          // blip) escape the fire-and-forget loop as an unhandled rejection
+          // and crash the host process.
+          this.#reportError(err);
+          backoffMs = Math.min(
+            Math.max(backoffMs * 2, this.#opts.pollIntervalMs),
+            MAX_BACKOFF_MS,
+          );
+          waitMs = backoffMs;
+        }
+        if (this.#stopped) break;
         const wakeupPromise = new Promise<void>((resolve) => {
           this.#wakeup = resolve;
           this.#pollTimer = setTimeout(
             resolve,
-            this.#opts.pollIntervalMs,
+            waitMs,
           ) as unknown as number;
         });
         await wakeupPromise;
@@ -532,10 +562,10 @@ export class PostgresDriver implements QueueDriver {
       }
     };
 
-    this.#startNotifyClient().catch(() => {
-      // Notify failure falls back to polling.
-    });
-    loop();
+    // Notify is best-effort. Polling makes progress without it.
+    this.#startNotifyClient().catch((err) => this.#reportError(err));
+    // Final safety net so a stray rejection cannot escape the loop.
+    loop().catch((err) => this.#reportError(err));
 
     this.#cleanupTimer = setInterval(() => {
       this.#pool.query(
@@ -574,6 +604,19 @@ export class PostgresDriver implements QueueDriver {
       this.#notifyClient = undefined;
     }
     await this.#pool.end();
+  }
+
+  #reportError(err: unknown): void {
+    const onError = this.#opts.onError;
+    if (!onError) {
+      console.error("[snaapi/queue] worker error:", err);
+      return;
+    }
+    try {
+      onError(err);
+    } catch (_handlerErr) {
+      // A throwing onError must not crash the loop. Drop it.
+    }
   }
 
   async #reserveOne(): Promise<{ id: string; envelope: QueueEnvelope } | null> {

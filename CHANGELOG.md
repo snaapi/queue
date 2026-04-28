@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `PostgresDriver.listen()` no longer crashes the host process when the worker
+  loop hits a connection error. The poll loop catches driver errors, surfaces
+  them through a new `onError` option (defaulting to `console.error`), and backs
+  off (capped at 30 seconds) before retrying instead of escaping as an unhandled
+  rejection.
+
+### Added
+
+- `PostgresDriverOptions.onError`. Invoked with any error raised by the polling
+  loop or the `LISTEN`/`NOTIFY` client.
+
 ## [2.0.0] - 2026-04-27
 
 ### Fixed
