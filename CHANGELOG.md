@@ -1,6 +1,11 @@
 # Changelog
 
-## [Unreleased]
+## [2.1.0] - 2026-04-28
+
+### Other
+
+- Merge pull request #2 from snaapi/bugfix
+- handle errors better
 
 ### Fixed
 
