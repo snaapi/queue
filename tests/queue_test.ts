@@ -446,3 +446,32 @@ pgTest("withoutOverlapping skips concurrent runs", async () => {
     assertEquals(completed, 1);
   }, { concurrency: 2 });
 });
+
+Deno.test({
+  name: "worker survives unreachable DB and surfaces errors via onError",
+  // The pool keeps reconnect timers alive past the test body.
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const errors: unknown[] = [];
+    const driver = new PostgresDriver({
+      // Port 1 is reserved and refuses connections, so every poll fails.
+      connectionString: "postgres://nobody:nobody@127.0.0.1:1/none",
+      pollIntervalMs: 50,
+      autoMigrate: false,
+      onError: (err) => errors.push(err),
+    });
+    const queue = new Queue(driver);
+    queue.register("noop", { handle: () => Promise.resolve() });
+
+    queue.listen();
+    await new Promise((r) => setTimeout(r, 400));
+    await queue.close();
+
+    assertEquals(
+      errors.length > 0,
+      true,
+      `expected at least one onError invocation, got ${errors.length}`,
+    );
+  },
+});
